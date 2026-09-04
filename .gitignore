@@ -1,0 +1,11 @@
+# Xcode
+build/
+DerivedData/
+xcuserdata/
+*.xcworkspace
+*.xccheckout
+.DS_Store
+
+# 编辑器配置文件
+.vscode/
+.idea/
