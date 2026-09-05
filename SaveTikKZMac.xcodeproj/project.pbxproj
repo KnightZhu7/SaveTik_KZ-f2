@@ -21,6 +21,7 @@
 				Models/Models.swift,
 				SaveTikKZApp.swift,
 				Services/APIService.swift,
+				Services/ImageCacheManager.swift,
 				Services/MediaCacheManager.swift,
 				Services/PhotoExportManager.swift,
 				ViewModels/ContentViewModel.swift,
@@ -281,7 +282,7 @@
 				AUTOMATION_APPLE_EVENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 0;
+				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = QACQ9N662F;
 				ENABLE_APP_SANDBOX = NO;
@@ -334,7 +335,7 @@
 				AUTOMATION_APPLE_EVENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 0;
+				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = QACQ9N662F;
 				ENABLE_APP_SANDBOX = NO;

@@ -34,6 +34,33 @@ struct ImageGridCell: View {
     @State private var player: AVPlayer?
     @State private var hasPlayedOnce = false
     
+    // 🔥 显式构造函数：直接从内存缓存装载已预载的图片，实现首帧真实出图无骨架跳动
+    init(
+        index: Int,
+        item: ImageItem,
+        isSelected: Bool,
+        isSelectionMode: Bool,
+        colorScheme: ColorScheme,
+        isLiveMode: Binding<Bool>,
+        userAgent: String?,
+        onSelectToggle: @escaping () -> Void,
+        onDownloadSingle: @escaping () -> Void
+    ) {
+        self.index = index
+        self.item = item
+        self.isSelected = isSelected
+        self.isSelectionMode = isSelectionMode
+        self.colorScheme = colorScheme
+        self._isLiveMode = isLiveMode
+        self.userAgent = userAgent
+        self.onSelectToggle = onSelectToggle
+        self.onDownloadSingle = onDownloadSingle
+        
+        if let cached = ImageCacheManager.shared.image(for: item.imageUrl) {
+            self._coverImage = State(initialValue: cached)
+        }
+    }
+    
     // 🔥 真实分辨率与长宽比：优先使用已下载图片的真实物理像素，防止后端元数据错误导致黑边或缩放变形
     private var realImageSize: CGSize {
         if let img = coverImage {
@@ -287,6 +314,16 @@ struct ImageGridCell: View {
     // MARK: - 自定义图片加载逻辑
     private func loadCoverImage() async {
         guard coverImage == nil else { return }
+        
+        // 1. 优先读取内存缓存
+        if let cached = ImageCacheManager.shared.image(for: item.imageUrl) {
+            await MainActor.run {
+                self.coverImage = cached
+                self.isImageLoading = false
+            }
+            return
+        }
+        
         await MainActor.run { isImageLoading = true; isImageFailed = false }
         
         guard let url = URL(string: item.imageUrl) else {
@@ -303,6 +340,7 @@ struct ImageGridCell: View {
             let (data, response) = try await URLSession.shared.data(for: request)
             if let httpRes = response as? HTTPURLResponse, httpRes.statusCode == 200,
                let img = NSImage(data: data) {
+                ImageCacheManager.shared.storeImage(img, for: item.imageUrl)
                 await MainActor.run {
                     self.coverImage = img
                     self.isImageLoading = false

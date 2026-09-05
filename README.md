@@ -27,7 +27,7 @@ For detailed information about this project's features—including **quality/cod
 
 ## Download Latest Release
 
-**[SaveTik_KZ V2.0.0](https://github.com/KnightZhu7/SaveTik_KZ-f2/releases/tag/V2.0.0)**
+**[SaveTik_KZ V2.0.1](https://github.com/KnightZhu7/SaveTik_KZ-f2/releases/tag/V2.0.1)**
 
 ---
 

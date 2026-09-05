@@ -39,12 +39,12 @@ struct VideoStream: Codable, Identifiable, Equatable {
     }
 }
 
-// 🔥 新增：图片/Live图流模型
+// MARK: - 图片/Live图流模型
 struct ImageItem: Codable, Identifiable, Equatable {
     let id = UUID()
     let imageUrl: String
-    let width: Int
-    let height: Int
+    var width: Int       // 👈 由 let 改为 var，支持尺寸动态校准
+    var height: Int      // 👈 由 let 改为 var，支持尺寸动态校准
     let liveVideoUrl: String? // Live图独有，可能为空
     
     enum CodingKeys: String, CodingKey {
