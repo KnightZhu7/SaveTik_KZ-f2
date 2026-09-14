@@ -171,7 +171,30 @@ struct ContentView: View {
             .padding(.trailing, 10)
             .padding(.top, 8)
             .ignoresSafeArea(.container, edges: .top)
+            
+            // 6. 全屏同窗口液态玻璃登录模态浮层（真正穿透并动态模糊 App 背后界面元素）
+            if viewModel.showDouyinLoginModal {
+                ZStack {
+                    // 全屏微暗遮罩（支持点击卡片外部空白区域平滑退出）
+                    Color.black.opacity(0.2)
+                        .ignoresSafeArea()
+                        .transition(.opacity)
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                                viewModel.showDouyinLoginModal = false
+                            }
+                        }
+                    
+                    // 居中展示液态玻璃登录卡片
+                    DouyinLoginSheet(isPresented: $viewModel.showDouyinLoginModal)
+                        .transition(.scale(scale: 0.94).combined(with: .opacity))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+                .zIndex(100)
+            }
         }
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: viewModel.showDouyinLoginModal)
         .frame(minWidth: 700, minHeight: 550)
         .coordinateSpace(name: "AppWindowSpace")
         .onPreferenceChange(ItemFramePreferenceKey.self) { frames in

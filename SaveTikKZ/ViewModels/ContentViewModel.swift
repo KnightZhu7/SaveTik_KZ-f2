@@ -22,6 +22,9 @@ class ContentViewModel: ObservableObject {
     // 🔥 新增：统一管理每张图片的 Live 下载意图 (默认开启)
     @Published var imageLiveModes: [UUID: Bool] = [:]
     
+    // 🔥 统一控制抖音登录模态窗在主窗口内部全屏呈现（实现同窗口真液态玻璃折射）
+    @Published var showDouyinLoginModal: Bool = false
+    
     @Published var currentMetadata: [String: String] = [:]
     
     // 图片筛选模式状态
@@ -250,6 +253,11 @@ class ContentViewModel: ObservableObject {
         updateStatus("正在获取...", type: .connect)
         videoList = []
         selectedVideos = []
+        imageList = []
+        selectedImages = []
+        imageLiveModes = [:]
+        resolutionTokens = []
+        encodingTokens = []
         currentMetadata = [:]
         
         let rawText = urlInput

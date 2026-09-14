@@ -11,6 +11,7 @@
 //
 
 import Foundation
+import WebKit
 
 // MARK: - SM3 National Standard Cryptographic Hash (GB/T 32918-2016)
 nonisolated public struct SM3 {
@@ -215,7 +216,7 @@ nonisolated public class ABogus {
             let sizeH = Int.random(in: 768...1080)
             let availW = Int.random(in: 1280...1920)
             let availH = Int.random(in: 800...1080)
-            self.browserFp = "\(innerW)|\(innerH)|\(outerW)|\(outerH)|0|\(screenY)|0|0|\(sizeW)|\(sizeH)|\(availW)|\(availH)|\(innerW)|\(innerH)|24|24|Win32"
+            self.browserFp = "\(innerW)|\(innerH)|\(outerW)|\(outerH)|0|\(screenY)|0|0|\(sizeW)|\(sizeH)|\(availW)|\(availH)|\(innerW)|\(innerH)|24|24|MacIntel"
         }
     }
     
@@ -444,14 +445,116 @@ nonisolated class DouyinService: @unchecked Sendable {
         
         var request = URLRequest(url: url)
         request.setValue(ABogus.defaultUA, forHTTPHeaderField: "User-Agent")
+        request.httpShouldHandleCookies = false
+        request.timeoutInterval = 10
         
-        let (_, response) = try await URLSession.shared.data(for: request)
-        if let finalURL = response.url?.absoluteString,
+        // 1. 优先尝试系统默认路由解析重定向
+        do {
+            let (_, response) = try await performResilientData(for: request, forceDirect: false)
+            if let finalURL = response.url?.absoluteString,
+               let awemeId = matchDigitsId(in: finalURL) {
+                return awemeId
+            }
+        } catch {
+            print("ℹ️ [DouyinService] 短链接系统路由重定向受阻 (\(error.localizedDescription))，尝试强制直连国内节点...")
+        }
+        
+        // 2. 容灾方案：若系统路由受阻，强制直连国内节点解析
+        let (_, directResponse) = try await performResilientData(for: request, forceDirect: true)
+        if let finalURL = directResponse.url?.absoluteString,
            let awemeId = matchDigitsId(in: finalURL) {
             return awemeId
         }
         
         throw NSError(domain: "DouyinService", code: -1, userInfo: [NSLocalizedDescriptionKey: "解析失败：无法获取目标作品 ID"])
+    }
+    
+    // MARK: - 网络会话生命周期管理 (纯净隔离 + 自动保活 + 连接重置)
+    private let sessionLock = NSLock()
+    private var _systemSession: URLSession?
+    private var _directSession: URLSession?
+    
+    private static func makeSessionConfiguration(direct: Bool) -> URLSessionConfiguration {
+        let config = URLSessionConfiguration.ephemeral
+        if direct {
+            config.connectionProxyDictionary = [:]
+        }
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 60
+        return config
+    }
+    
+    private var systemSession: URLSession {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        if let s = _systemSession { return s }
+        let s = URLSession(configuration: Self.makeSessionConfiguration(direct: false))
+        _systemSession = s
+        return s
+    }
+    
+    private var directSession: URLSession {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        if let s = _directSession { return s }
+        let s = URLSession(configuration: Self.makeSessionConfiguration(direct: true))
+        _directSession = s
+        return s
+    }
+    
+    /// 当遇到 403 阻断或重置用户凭据时，彻底切断已污染的 HTTP/2 传输通道并重置会话
+    func resetSessions() {
+        sessionLock.lock()
+        let oldSys = _systemSession
+        let oldDir = _directSession
+        _systemSession = nil
+        _directSession = nil
+        sessionLock.unlock()
+        
+        oldSys?.invalidateAndCancel()
+        oldDir?.invalidateAndCancel()
+    }
+    
+    // MARK: - 网络请求代理容灾与自动直连降级
+    func performResilientData(for request: URLRequest, forceDirect: Bool = false) async throws -> (Data, URLResponse) {
+        if forceDirect {
+            return try await directSession.data(for: request)
+        }
+        
+        do {
+            return try await systemSession.data(for: request)
+        } catch {
+            let nsErr = error as NSError
+            if nsErr.domain == NSURLErrorDomain || nsErr.domain == (kCFErrorDomainCFNetwork as String) ||
+               nsErr.code == 310 || nsErr.code == -1004 || nsErr.code == -1009 || nsErr.code == -1001 || nsErr.code == -1005 {
+                print("ℹ️ [DouyinService] 系统路由连接受阻 (\(nsErr.code): \(error.localizedDescription))，自动降级直连国内节点...")
+                return try await directSession.data(for: request)
+            }
+            throw error
+        }
+    }
+    
+    func performResilientDownload(for request: URLRequest, forceDirect: Bool = false) async throws -> (URL, URLResponse) {
+        if forceDirect {
+            return try await directSession.download(for: request)
+        }
+        
+        do {
+            return try await systemSession.download(for: request)
+        } catch {
+            let nsErr = error as NSError
+            if nsErr.domain == NSURLErrorDomain || nsErr.domain == (kCFErrorDomainCFNetwork as String) ||
+               nsErr.code == 310 || nsErr.code == -1004 || nsErr.code == -1009 || nsErr.code == -1001 || nsErr.code == -1005 {
+                print("ℹ️ [DouyinService] 系统路由下载受阻 (\(nsErr.code): \(error.localizedDescription))，自动降级直连国内节点...")
+                return try await directSession.download(for: request)
+            }
+            throw error
+        }
     }
     
     private func matchDigitsId(in str: String) -> String? {
@@ -466,101 +569,331 @@ nonisolated class DouyinService: @unchecked Sendable {
         return nil
     }
     
-    private var cachedVisitorCookie: String = ""
-    private var lastCookieFetchTime: Date = .distantPast
+    private var cachedTTWID: String = ""
+    private var lastTTWIDFetchTime: Date = .distantPast
     
-    // MARK: - 2. 获取有效 Cookie（支持用户自定义 Cookie，或自动获取具备 ttwid/UIFID 的防拦截访客 Cookie）
-    func getEffectiveCookies(forceRefresh: Bool = false) async -> String {
-        // 1. 如果用户在 UserDefaults 中配置了自定义 Cookie，优先使用用户 Cookie
-        if let custom = UserDefaults.standard.string(forKey: "SaveTik_CustomCookie")?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
-            return custom
+    // MARK: - 2. Cookie 净化与凭据模式管理
+    /// 严格保留长期稳定的鉴权与设备识别项，剔除临时握手与单次 Token (passport_auth_mix_state, n_mh, s_v_web_id 等)
+    static func sanitizeCookieString(_ raw: String, minimal: Bool = false) -> String {
+        let allowedPrefixes: Set<String>
+        if minimal {
+            // 核心鉴权最小集：去除可能在服务端轮换脱节的辅助 Token，仅保留核心会话与 CSRF 项
+            allowedPrefixes = [
+                "sessionid", "sessionid_ss", "sid_tt", "sid_guard",
+                "uid_tt", "uid_tt_ss", "passport_csrf_token", "passport_csrf_token_default"
+            ]
+        } else {
+            allowedPrefixes = [
+                "sessionid", "sessionid_ss", "sid_tt", "sid_guard",
+                "uid_tt", "uid_tt_ss", "passport_csrf_token", "passport_csrf_token_default",
+                "odin_tt", "ttwid", "hevc_supported", "isdouyinactive", "is_dash_user"
+            ]
         }
         
-        // 2. 检查缓存的访客 Cookie（有效保留 2 小时）
-        if !forceRefresh && !cachedVisitorCookie.isEmpty && Date().timeIntervalSince(lastCookieFetchTime) < 7200 {
-            return cachedVisitorCookie
-        }
+        let items = raw.components(separatedBy: ";")
+        var resultPairs: [String] = []
+        var seenNames = Set<String>()
         
-        // 3. 从抖音首页与 ttwid 接口动态拉取完整防拦截 Cookie (含 ttwid, enter_pc_once, UIFID, DASH/HEVC能力)
-        var cookieDict = [String: String]()
-        cookieDict["enter_pc_once"] = "1"
-        cookieDict["is_dash_user"] = "1"
-        cookieDict["hevc_supported"] = "true"
-        
-        if let liveUrl = URL(string: "https://live.douyin.com/") {
-            var req = URLRequest(url: liveUrl)
-            req.setValue(ABogus.defaultUA, forHTTPHeaderField: "User-Agent")
-            req.timeoutInterval = 8
-            _ = try? await URLSession.shared.data(for: req)
+        for item in items {
+            let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let eqIdx = trimmed.firstIndex(of: "=") else { continue }
+            let name = String(trimmed[..<eqIdx]).trimmingCharacters(in: .whitespaces)
+            let value = String(trimmed[trimmed.index(after: eqIdx)...]).trimmingCharacters(in: .whitespaces)
+            let lowerName = name.lowercased()
             
-            if let cookies = HTTPCookieStorage.shared.cookies(for: liveUrl) {
-                for c in cookies {
-                    cookieDict[c.name] = c.value
-                }
+            if allowedPrefixes.contains(lowerName) && !seenNames.contains(lowerName) {
+                seenNames.insert(lowerName)
+                resultPairs.append("\(name)=\(value)")
             }
         }
-        
-        if let homeUrl = URL(string: "https://www.douyin.com/") {
-            var req = URLRequest(url: homeUrl)
-            req.setValue(ABogus.defaultUA, forHTTPHeaderField: "User-Agent")
-            req.timeoutInterval = 8
-            _ = try? await URLSession.shared.data(for: req)
-            
-            if let cookies = HTTPCookieStorage.shared.cookies(for: homeUrl) {
-                for c in cookies {
-                    if cookieDict[c.name] == nil {
-                        cookieDict[c.name] = c.value
-                    }
-                }
-            }
-        }
-        
-        // 遍历所有 .douyin.com 域下的 Cookie (确保获取到 UIFID_TEMP, UIFID, odin_tt, ttwid)
-        if let allCookies = HTTPCookieStorage.shared.cookies {
-            for c in allCookies where c.domain.contains("douyin.com") {
-                if cookieDict[c.name] == nil {
-                    cookieDict[c.name] = c.value
-                }
-            }
-        }
-        
-        // 如果缺少 ttwid，通过专用注册接口补充
-        if cookieDict["ttwid"] == nil {
-            if let regUrl = URL(string: "https://ttwid.bytedance.com/ttwid/union/register/") {
-                var regReq = URLRequest(url: regUrl)
-                regReq.httpMethod = "POST"
-                regReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                regReq.setValue(ABogus.defaultUA, forHTTPHeaderField: "User-Agent")
-                let payload = """
-                {"region":"cn","aid":1768,"needFid":false,"service":"www.ixigua.com","migrate_info":{"ticket":"","source":"node"},"cbUrlProtocol":"https","union":true}
-                """
-                regReq.httpBody = payload.data(using: .utf8)
-                _ = try? await URLSession.shared.data(for: regReq)
-                if let regCookies = HTTPCookieStorage.shared.cookies(for: regUrl) {
-                    for c in regCookies {
-                        if c.name == "ttwid" {
-                            cookieDict["ttwid"] = c.value
-                            break
-                        }
-                    }
-                }
-            }
-        }
-        
-        // 如果获取到 UIFID_TEMP，同步赋值 UIFID 满足 ArgusSecurityPlugin 安全网关校验
-        if let uTemp = cookieDict["UIFID_TEMP"] ?? cookieDict["uifid_temp"] {
-            cookieDict["UIFID"] = uTemp
-        }
-        
-        let fullCookie = cookieDict.map { "\($0.key)=\($0.value);" }.joined(separator: " ")
-        if !fullCookie.isEmpty {
-            self.cachedVisitorCookie = fullCookie
-            self.lastCookieFetchTime = Date()
-        }
-        return self.cachedVisitorCookie
+        return resultPairs.joined(separator: "; ")
     }
     
-    // MARK: - 3. 生成虚假 msToken
+    /// 从服务端响应头中动态捕获轮转的 odin_tt / ttwid 并回写更新本地存储，保持 Token 永远与抖音官方实时同步
+    static func updateCookiesFromResponse(_ response: URLResponse, targetUrl: URL) {
+        guard let httpResponse = response as? HTTPURLResponse,
+              let fields = httpResponse.allHeaderFields as? [String: String] else { return }
+        
+        let receivedCookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: targetUrl)
+        guard !receivedCookies.isEmpty else { return }
+        
+        let currentCustom = UserDefaults.standard.string(forKey: "SaveTik_CustomCookie") ?? ""
+        guard currentCustom.contains("sessionid=") else { return }
+        
+        var cookieMap: [String: String] = [:]
+        for item in currentCustom.components(separatedBy: ";") {
+            let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let eqIdx = trimmed.firstIndex(of: "=") else { continue }
+            let k = String(trimmed[..<eqIdx]).trimmingCharacters(in: .whitespaces)
+            let v = String(trimmed[trimmed.index(after: eqIdx)...]).trimmingCharacters(in: .whitespaces)
+            if !k.isEmpty && !v.isEmpty {
+                cookieMap[k] = v
+            }
+        }
+        
+        var hasChanges = false
+        for c in receivedCookies {
+            let name = c.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let val = c.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if (name == "odin_tt" || name == "ttwid") && !val.isEmpty {
+                if cookieMap[name] != val {
+                    cookieMap[name] = val
+                    hasChanges = true
+                    print("🔄 [DouyinService] 动态同步服务端新 Token: \(name)=\(val.prefix(16))...")
+                }
+            }
+        }
+        
+        if hasChanges {
+            let rawStr = cookieMap.map { "\($0.key)=\($0.value);" }.joined(separator: " ")
+            let sanitized = sanitizeCookieString(rawStr, minimal: false)
+            UserDefaults.standard.set(sanitized, forKey: "SaveTik_CustomCookie")
+            UserDefaults.standard.synchronize()
+        }
+    }
+    
+    enum CookieMode {
+        case preferCustom(minimal: Bool)
+        case forceVisitor(forceRefresh: Bool)
+    }
+    
+    func getEffectiveCookies(mode: CookieMode = .preferCustom(minimal: false)) async -> String {
+        switch mode {
+        case .preferCustom(let minimal):
+            if let custom = UserDefaults.standard.string(forKey: "SaveTik_CustomCookie")?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
+                let sanitized = DouyinService.sanitizeCookieString(custom, minimal: minimal)
+                if !sanitized.isEmpty {
+                    return sanitized
+                }
+            }
+            return await getVisitorCookies(forceRefresh: false)
+            
+        case .forceVisitor(let forceRefresh):
+            return await getVisitorCookies(forceRefresh: forceRefresh)
+        }
+    }
+    
+    private func getVisitorCookies(forceRefresh: Bool) async -> String {
+        if forceRefresh {
+            self.cachedTTWID = ""
+            self.lastTTWIDFetchTime = .distantPast
+        } else if !cachedTTWID.isEmpty && Date().timeIntervalSince(lastTTWIDFetchTime) < 7200 {
+            return "ttwid=\(cachedTTWID);"
+        }
+        
+        if let ttwid = await fetchCleanTTWID(forceRefresh: forceRefresh) {
+            self.cachedTTWID = ttwid
+            self.lastTTWIDFetchTime = Date()
+            return "ttwid=\(ttwid);"
+        }
+        
+        return ""
+    }
+    
+    /// 清除内存中的凭证缓存并重置网络连接
+    func clearCachedCredentials() {
+        self.cachedTTWID = ""
+        self.lastTTWIDFetchTime = .distantPast
+        self.resetSessions()
+    }
+    
+    // MARK: - 3. 验证用户登录凭证有效性（向抖音官方接口发起在线真实鉴权）
+    enum SessionStatus: Equatable {
+        case valid(nickname: String?)
+        case invalid(reason: String)
+        case networkError(String)
+    }
+    
+    func verifySessionValidity(cookieString: String) async -> SessionStatus {
+        guard !cookieString.isEmpty, cookieString.contains("sessionid=") else {
+            return .invalid(reason: "本地未保存有效凭证")
+        }
+        
+        // 直接使用抖音官方电脑 Web 端权威个人资料接口（携带 a_bogus 权威签名与完整规范参数）
+        let msToken = generateFalseMsToken()
+        let params = "device_platform=webapp&aid=6383&channel=channel_pc_web&pc_client_type=1&version_code=290100&version_name=29.1.0&msToken=\(msToken)"
+        let ab = ABogus()
+        let abogus = ab.generateABogus(params: params)
+        let fullUrlStr = "https://www.douyin.com/aweme/v1/web/user/profile/self/?\(params)&a_bogus=\(abogus)"
+        
+        guard let url = URL(string: fullUrlStr) else {
+            return .invalid(reason: "鉴权接口地址无效")
+        }
+        
+        let cleanCookie = DouyinService.sanitizeCookieString(cookieString)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(ABogus.defaultUA, forHTTPHeaderField: "User-Agent")
+        request.setValue("https://www.douyin.com/", forHTTPHeaderField: "Referer")
+        request.setValue(cleanCookie, forHTTPHeaderField: "Cookie")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        request.setValue("zh-CN,zh;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
+        request.setValue("\"macOS\"", forHTTPHeaderField: "sec-ch-ua-platform")
+        request.setValue("\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"", forHTTPHeaderField: "sec-ch-ua")
+        request.setValue("?0", forHTTPHeaderField: "sec-ch-ua-mobile")
+        request.setValue("empty", forHTTPHeaderField: "sec-fetch-dest")
+        request.setValue("cors", forHTTPHeaderField: "sec-fetch-mode")
+        request.setValue("same-origin", forHTTPHeaderField: "sec-fetch-site")
+        request.httpShouldHandleCookies = false
+        request.timeoutInterval = 15
+        
+        do {
+            let (data, response) = try await performResilientData(for: request, forceDirect: false)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return .networkError("无效的网络响应")
+            }
+            
+            // 1. 明确的授权失效 HTTP 状态码
+            // 401 (Unauthorized), 403 (Forbidden), 410 (Gone), 419 (Session Expired), 423 (Locked)
+            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 || httpResponse.statusCode == 410 || httpResponse.statusCode == 419 || httpResponse.statusCode == 423 {
+                return .invalid(reason: "登录凭证已失效或已被远端设备退出 (\(httpResponse.statusCode))")
+            }
+            
+            // 2. HTTP 重定向状态码（301, 302, 303, 307, 308）或重定向离开个人资料 API
+            let isRedirect = (300...399).contains(httpResponse.statusCode)
+            if isRedirect {
+                return .invalid(reason: "登录凭证已失效（已被重定向至登录页）")
+            }
+            
+            if let finalUrl = httpResponse.url?.absoluteString, !finalUrl.contains("/aweme/v1/web/user/profile/self") {
+                return .invalid(reason: "登录凭证已失效（已被重定向至登录页）")
+            }
+            
+            // 3. 客户端请求错误（400 传参或凭证失效格式）
+            if (400...499).contains(httpResponse.statusCode) {
+                return .invalid(reason: "登录凭证已失效 (\(httpResponse.statusCode))")
+            }
+            
+            // 4. 服务器异常（500/502/503/504 等真正的服务端网络错误）
+            guard httpResponse.statusCode == 200 else {
+                return .networkError("服务器响应状态码: \(httpResponse.statusCode)")
+            }
+            
+            // 5. 解析返回 JSON 数据
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                // 若状态码为 200 但返回非 JSON（如重定向登录 HTML、滑动验证码挑战或页面源码），明确代表凭证失效需要重新鉴权
+                return .invalid(reason: "登录凭证已失效或需重新验证")
+            }
+            
+            let statusCode = json["status_code"] as? Int ?? -1
+            let statusMsg = json["status_msg"] as? String ?? ""
+            
+            // 6. 抖音官方个人资料接口：status_code == 0 且包含 user 对象即为有效登录
+            if statusCode == 0, let user = json["user"] as? [String: Any] {
+                let nickname = user["nickname"] as? String
+                return .valid(nickname: nickname)
+            }
+            
+            // 7. 服务端明确返回未登录 / 已过期 / 已被远端退出（status_code == 8 或 status_msg 提示）
+            if statusCode == 8 || statusMsg.contains("未登录") || statusMsg.contains("过期") || statusMsg.contains("退出") || statusMsg.contains("失效") {
+                return .invalid(reason: statusMsg.isEmpty ? "会话已过期或已被远端设备退出" : statusMsg)
+            }
+            
+            // 8. 兜底解析（若接口返回包含其他合法结构）
+            let dataObj = json["data"] as? [String: Any] ?? [:]
+            let errorCode = dataObj["error_code"] as? Int ?? (json["error_code"] as? Int ?? 0)
+            if errorCode == 0 && (dataObj["user_id"] != nil || dataObj["sec_user_id"] != nil) {
+                let nickname = dataObj["name"] as? String ?? dataObj["nickname"] as? String
+                return .valid(nickname: nickname)
+            }
+            
+            // 9. 任何非 0 的业务状态码，一律判定为登录凭证已失效
+            return .invalid(reason: statusMsg.isEmpty ? "登录凭证已失效" : statusMsg)
+        } catch {
+            let err = error as NSError
+            if err.domain == NSURLErrorDomain && (err.code == NSURLErrorTimedOut || err.code == NSURLErrorNotConnectedToInternet || err.code == NSURLErrorNetworkConnectionLost || err.code == NSURLErrorCannotConnectToHost) {
+                return .networkError("网络连接超时或不可达")
+            }
+            return .networkError(error.localizedDescription)
+        }
+    }
+    
+    // MARK: - 4. 彻底清理用户登录会话与 WebKit 存储
+    @MainActor
+    static func clearAllAuthCookies() {
+        UserDefaults.standard.removeObject(forKey: "SaveTik_CustomCookie")
+        UserDefaults.standard.removeObject(forKey: "SaveTik_UserNickname")
+        UserDefaults.standard.synchronize()
+        DouyinService.shared.clearCachedCredentials()
+        
+        // 1. 清理系统网络请求（URLSession / HTTPCookieStorage）中的所有抖音及字节跳动凭据
+        if let cookies = HTTPCookieStorage.shared.cookies {
+            for c in cookies {
+                let domain = c.domain.lowercased()
+                if domain.contains("douyin") || domain.contains("bytedance") || domain.contains("snssdk") || domain.contains("amemv") || domain.contains("iesdouyin") {
+                    HTTPCookieStorage.shared.deleteCookie(c)
+                }
+            }
+        }
+        
+        // 2. 彻底清除 WebKit 中的所有相关网站数据（Cookies、LocalStorage、IndexedDB、ServiceWorkers、WebSQL 等），防止会话静默复活
+        let store = WKWebsiteDataStore.default()
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        store.fetchDataRecords(ofTypes: dataTypes) { records in
+            let targets = records.filter { r in
+                let name = r.displayName.lowercased()
+                return name.contains("douyin") || name.contains("bytedance") || name.contains("snssdk") || name.contains("amemv") || name.contains("iesdouyin")
+            }
+            if !targets.isEmpty {
+                store.removeData(ofTypes: dataTypes, for: targets, completionHandler: {
+                    print("🧹 [DouyinService] 已彻底清除 WebKit 存储记录: \(targets.map { $0.displayName })")
+                })
+            }
+        }
+        
+        // 3. 同时遍历 WebKit httpCookieStore 删除所有匹配的 Cookie
+        store.httpCookieStore.getAllCookies { cookies in
+            for c in cookies {
+                let domain = c.domain.lowercased()
+                if domain.contains("douyin") || domain.contains("bytedance") || domain.contains("snssdk") || domain.contains("amemv") || domain.contains("iesdouyin") {
+                    store.httpCookieStore.delete(c, completionHandler: nil)
+                }
+            }
+        }
+    }
+    
+    private func fetchCleanTTWID(forceRefresh: Bool) async -> String? {
+        guard let regUrl = URL(string: "https://ttwid.bytedance.com/ttwid/union/register/") else { return nil }
+        
+        var regReq = URLRequest(url: regUrl)
+        regReq.httpMethod = "POST"
+        regReq.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        regReq.setValue(ABogus.defaultUA, forHTTPHeaderField: "User-Agent")
+        let payload = """
+        {"region":"cn","aid":1768,"needFid":false,"service":"www.ixigua.com","migrate_info":{"ticket":"","source":"node"},"cbUrlProtocol":"https","union":true}
+        """
+        regReq.httpBody = payload.data(using: .utf8)
+        regReq.httpShouldHandleCookies = false
+        regReq.timeoutInterval = 8
+        
+        // 优先系统网络（支持系统代理/默认网络）
+        do {
+            let (_, response) = try await performResilientData(for: regReq, forceDirect: false)
+            if let httpRes = response as? HTTPURLResponse,
+               let fields = httpRes.allHeaderFields as? [String: String] {
+                let cookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: regUrl)
+                if let ttwid = cookies.first(where: { $0.name == "ttwid" })?.value, !ttwid.isEmpty {
+                    return ttwid
+                }
+            }
+        } catch {
+            print("[-] [DouyinService] 注册 ttwid 系统路由异常: \(error.localizedDescription)，尝试直连...")
+        }
+        
+        // 强制直连国内节点兜底
+        if let (_, response) = try? await performResilientData(for: regReq, forceDirect: true),
+           let httpRes = response as? HTTPURLResponse,
+           let fields = httpRes.allHeaderFields as? [String: String] {
+            let cookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: regUrl)
+            if let ttwid = cookies.first(where: { $0.name == "ttwid" })?.value, !ttwid.isEmpty {
+                return ttwid
+            }
+        }
+        
+        return nil
+    }
+    
+    // MARK: - 3. 动态生成客户端特征与虚假 msToken
     private func generateFalseMsToken() -> String {
         let chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
         var res = ""
@@ -570,29 +903,94 @@ nonisolated class DouyinService: @unchecked Sendable {
         return res + "=="
     }
     
-    // MARK: - 4. 核心解析逻辑（内置自动重试与反抖动机制）
+    /// 动态生成客户端特征与网络指纹微扰动参数，消除高频连续请求时因固定硬件特征引发的 WAF 频控撞车
+    private func generateParams(awemeId: String, attempt: Int) -> String {
+        let screenPresets: [(w: Int, h: Int)] = [
+            (1920, 1080),
+            (2560, 1440),
+            (1680, 1050),
+            (1440, 900),
+            (2880, 1800)
+        ]
+        let screen = screenPresets[(attempt - 1) % screenPresets.count]
+        let cpuCores = [12, 10, 8, 14, 16][(attempt - 1) % 5]
+        let devMemory = [8, 16, 32][(attempt - 1) % 3]
+        let rtt = Int.random(in: 60...120)
+        let downlink = String(format: "%.1f", Double.random(in: 8.5...15.0))
+        let msToken = generateFalseMsToken()
+        
+        return "device_platform=webapp&aid=6383&channel=channel_pc_web&pc_client_type=1&publish_video_strategy_type=2&pc_libra_divert=Mac&version_code=290100&version_name=29.1.0&cookie_enabled=true&screen_width=\(screen.w)&screen_height=\(screen.h)&browser_language=zh-CN&browser_platform=MacIntel&browser_name=Chrome&browser_version=130.0.0.0&browser_online=true&engine_name=Blink&engine_version=130.0.0.0&os_name=Mac%20OS&os_version=10.15.7&cpu_core_num=\(cpuCores)&device_memory=\(devMemory)&platform=PC&downlink=\(downlink)&effective_type=4g&round_trip_time=\(rtt)&msToken=\(msToken)&aweme_id=\(awemeId)"
+    }
+    
+    // MARK: - 4. 核心解析逻辑（内置多级网络阶梯容灾与凭据智能自愈机制）
     func parse(input: String) async throws -> (mediaType: String, streams: [VideoStream]?, images: [ImageItem]?, metadata: [String: String]) {
         let awemeId = try await resolveAwemeId(from: input)
         
         var lastError: Error?
-        let maxAttempts = 3
+        let maxAttempts = 5
+        let hasCustom = !(UserDefaults.standard.string(forKey: "SaveTik_CustomCookie") ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         
         for attempt in 1...maxAttempts {
             do {
-                let cookies = await getEffectiveCookies(forceRefresh: (attempt > 1))
-                let msToken = generateFalseMsToken()
+                let forceDirect: Bool
+                let cookieMode: CookieMode
+                let attemptDesc: String
                 
-                // 提取 UIFID 供 URL 参数及请求头复用
-                var uifidVal = ""
-                if let uifidRange = cookies.range(of: "UIFID=") {
-                    let sub = cookies[uifidRange.upperBound...]
-                    uifidVal = String(sub.prefix(while: { $0 != ";" }))
+                if hasCustom {
+                    switch attempt {
+                    case 1:
+                        forceDirect = false
+                        cookieMode = .preferCustom(minimal: false)
+                        attemptDesc = "用户专属凭据 (系统网络)"
+                    case 2:
+                        // 凭据偶发频控或连接抖动时，保持用户登录身份，重置链路连接并微调指纹重试
+                        forceDirect = false
+                        cookieMode = .preferCustom(minimal: false)
+                        attemptDesc = "用户专属凭据 (链路重置与动态指纹)"
+                    case 3:
+                        // 自愈重试：精简剔除可能过期的辅助 Token，仅保留核心登录 Session，彻底避开 Token 轮换脱节
+                        forceDirect = false
+                        cookieMode = .preferCustom(minimal: true)
+                        attemptDesc = "用户核心凭据净化自愈 (系统网络)"
+                    case 4:
+                        // 强制绕过本地代理或异常隧道，直连国内骨干 CDN
+                        forceDirect = true
+                        cookieMode = .preferCustom(minimal: false)
+                        attemptDesc = "用户专属凭据 (直连国内节点兜底)"
+                    default: // 5
+                        forceDirect = true
+                        cookieMode = .preferCustom(minimal: true)
+                        attemptDesc = "用户核心凭据 (直连终极重试)"
+                    }
+                } else {
+                    switch attempt {
+                    case 1:
+                        forceDirect = false
+                        cookieMode = .forceVisitor(forceRefresh: false)
+                        attemptDesc = "访客凭证 (系统网络)"
+                    case 2:
+                        forceDirect = false
+                        cookieMode = .forceVisitor(forceRefresh: true)
+                        attemptDesc = "刷新访客凭据 (系统网络)"
+                    case 3:
+                        forceDirect = true
+                        cookieMode = .forceVisitor(forceRefresh: false)
+                        attemptDesc = "访客凭据 (直连国内节点)"
+                    case 4:
+                        forceDirect = true
+                        cookieMode = .forceVisitor(forceRefresh: true)
+                        attemptDesc = "刷新访客凭据 (直连国内节点)"
+                    default: // 5
+                        forceDirect = false
+                        cookieMode = .forceVisitor(forceRefresh: true)
+                        attemptDesc = "访客模式终极重试"
+                    }
                 }
                 
-                var params = "device_platform=webapp&aid=6383&channel=channel_pc_web&aweme_id=\(awemeId)&request_source=600&origin_type=video_page&update_version_code=170400&pc_client_type=1&pc_libra_divert=Mac&support_h265=1&support_dash=1&cpu_core_num=10&version_code=190500&version_name=19.5.0&cookie_enabled=true&screen_width=1920&screen_height=1080&browser_language=zh-CN&browser_platform=MacIntel&browser_name=Chrome&browser_version=130.0.0.0&browser_online=true&engine_name=Blink&engine_version=130.0.0.0&os_name=Mac%20OS&os_version=10.15.7&device_memory=16&platform=PC&downlink=10&effective_type=4g&round_trip_time=100&msToken=\(msToken)"
-                if !uifidVal.isEmpty {
-                    params += "&uifid=\(uifidVal)"
-                }
+                print("🔄 [DouyinService] 发起第 \(attempt)/\(maxAttempts) 次解析请求 [\(attemptDesc)]...")
+                
+                let cookies = await getEffectiveCookies(mode: cookieMode)
+                let params = generateParams(awemeId: awemeId, attempt: attempt)
                 
                 let ab = ABogus()
                 let abogus = ab.generateABogus(params: params)
@@ -604,36 +1002,49 @@ nonisolated class DouyinService: @unchecked Sendable {
                 
                 var request = URLRequest(url: endpoint)
                 request.setValue(ABogus.defaultUA, forHTTPHeaderField: "User-Agent")
-                request.setValue("https://www.douyin.com/video/\(awemeId)", forHTTPHeaderField: "Referer")
+                request.setValue("https://www.douyin.com/", forHTTPHeaderField: "Referer")
                 if !cookies.isEmpty {
                     request.setValue(cookies, forHTTPHeaderField: "Cookie")
-                }
-                if !uifidVal.isEmpty {
-                    request.setValue(uifidVal, forHTTPHeaderField: "uifid")
                 }
                 request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
                 request.setValue("zh-CN,zh;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
                 request.setValue("\"macOS\"", forHTTPHeaderField: "sec-ch-ua-platform")
+                request.setValue("\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"", forHTTPHeaderField: "sec-ch-ua")
+                request.setValue("?0", forHTTPHeaderField: "sec-ch-ua-mobile")
+                request.setValue("empty", forHTTPHeaderField: "sec-fetch-dest")
+                request.setValue("cors", forHTTPHeaderField: "sec-fetch-mode")
+                request.setValue("same-origin", forHTTPHeaderField: "sec-fetch-site")
+                request.httpShouldHandleCookies = false
                 request.timeoutInterval = 12
                 
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await performResilientData(for: request, forceDirect: forceDirect)
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw NSError(domain: "DouyinService", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的网络响应"])
                 }
                 
-                // 若遭遇 403 (常见于特定 CDN 节点风控拦截)，自动刷新凭证与签名并重试
+                // 若遭遇 403 (频控/CDN/账号风控拦截)，断开被污染的链路并切换策略
                 if httpResponse.statusCode == 403 {
+                    print("⚠️ [DouyinService] 遇到 403 拦截 (尝试 \(attempt)/\(maxAttempts): \(attemptDesc))，断开已污染连接并切换下一策略...")
+                    resetSessions()
+                    
                     if attempt < maxAttempts {
-                        try await Task.sleep(nanoseconds: 120_000_000 * UInt64(attempt))
+                        let backoffSeconds = 0.3 + Double(attempt) * 0.2
+                        try await Task.sleep(nanoseconds: UInt64(backoffSeconds * 1_000_000_000))
                         continue
                     } else {
-                        throw NSError(domain: "DouyinService", code: 403, userInfo: [NSLocalizedDescriptionKey: "抖音节点安全校验限制 (403)，请稍后重试"])
+                        let tip = hasCustom
+                            ? "抖音安全校验限制 (403)，您的登录凭证可能已在远端失效或当前 IP 受到临时频控，建议稍候 1-2 分钟重试或重新扫码登录。"
+                            : "抖音节点安全校验限制 (403)：当前网络环境需登录抖音账号后方可解析，请点击右上角登录账号。"
+                        throw NSError(domain: "DouyinService", code: 403, userInfo: [NSLocalizedDescriptionKey: tip])
                     }
                 }
                 
                 guard httpResponse.statusCode == 200 else {
                     throw NSError(domain: "DouyinService", code: -1, userInfo: [NSLocalizedDescriptionKey: "网络请求异常，状态码: \(httpResponse.statusCode)"])
                 }
+                
+                // 动态同步响应中的新 Token（如 odin_tt / ttwid 轮换）
+                Self.updateCookiesFromResponse(httpResponse, targetUrl: endpoint)
                 
                 guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     throw NSError(domain: "DouyinService", code: -1, userInfo: [NSLocalizedDescriptionKey: "解析返回数据失败 (非合法 JSON)"])
@@ -647,11 +1058,20 @@ nonisolated class DouyinService: @unchecked Sendable {
                     throw NSError(domain: "DouyinService", code: -1, userInfo: [NSLocalizedDescriptionKey: "未能获取到作品详情，作品可能已被删除或设为私密"])
                 }
                 
+                if attempt >= 2 && hasCustom {
+                    print("💡 [DouyinService] 前序链路曾受阻，已通过阶梯自愈策略与动态特征扰动在第 \(attempt) 次成功解析！")
+                }
+                
                 return try extractParsedData(awemeDetail: awemeDetail)
             } catch {
                 lastError = error
+                if (error as NSError).code == 403 && attempt >= maxAttempts {
+                    break
+                }
+                resetSessions()
                 if attempt < maxAttempts {
-                    try await Task.sleep(nanoseconds: 100_000_000 * UInt64(attempt))
+                    let backoffSeconds = 0.3 + Double(attempt) * 0.2
+                    try await Task.sleep(nanoseconds: UInt64(backoffSeconds * 1_000_000_000))
                     continue
                 }
             }
@@ -896,7 +1316,7 @@ nonisolated class APIService: @unchecked Sendable {
         request.setValue(ABogus.defaultUA, forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 60
         
-        let (tempURL, response) = try await URLSession.shared.download(for: request)
+        let (tempURL, response) = try await DouyinService.shared.performResilientDownload(for: request)
         guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
             throw NSError(domain: "APIService", code: -1, userInfo: [NSLocalizedDescriptionKey: "视频下载失败，HTTP状态码: \((response as? HTTPURLResponse)?.statusCode ?? -1)"])
         }

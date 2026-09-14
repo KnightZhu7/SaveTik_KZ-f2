@@ -26,6 +26,7 @@
 				Services/PhotoExportManager.swift,
 				ViewModels/ContentViewModel.swift,
 				Views/Components/ActionBarView.swift,
+				Views/Components/DouyinLoginSheet.swift,
 				Views/Components/FilterPopoverView.swift,
 				Views/Components/HeaderButtonGroup.swift,
 				Views/Components/HeaderView.swift,
@@ -282,7 +283,7 @@
 				AUTOMATION_APPLE_EVENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = QACQ9N662F;
 				ENABLE_APP_SANDBOX = NO;
@@ -335,7 +336,7 @@
 				AUTOMATION_APPLE_EVENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = QACQ9N662F;
 				ENABLE_APP_SANDBOX = NO;

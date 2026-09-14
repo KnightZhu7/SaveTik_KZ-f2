@@ -219,11 +219,13 @@ struct ImageGridCell: View {
                             .cornerRadius(6)
                         }
                         .buttonStyle(.plain)
+                        .fixedSize(horizontal: true, vertical: false)
                     } else {
                         Text("JPEG")
                             .font(.system(size: 10, weight: .bold, design: .rounded))
                             .foregroundColor(badgeForeground).padding(.horizontal, 6).padding(.vertical, 4)
                             .background(badgeBackground).cornerRadius(6)
+                            .fixedSize(horizontal: true, vertical: false)
                             .allowsHitTesting(false)
                     }
                     
@@ -231,11 +233,11 @@ struct ImageGridCell: View {
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(badgeForeground).padding(.horizontal, 6).padding(.vertical, 4)
                         .background(badgeBackground).cornerRadius(6)
-                        .minimumScaleFactor(0.8)
                         .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                         .allowsHitTesting(false)
                     
-                    Spacer()
+                    Spacer(minLength: 0)
                 }
             }
             .padding(10)
