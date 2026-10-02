@@ -586,7 +586,7 @@ nonisolated class DouyinService: @unchecked Sendable {
             allowedPrefixes = [
                 "sessionid", "sessionid_ss", "sid_tt", "sid_guard",
                 "uid_tt", "uid_tt_ss", "passport_csrf_token", "passport_csrf_token_default",
-                "odin_tt", "ttwid", "hevc_supported", "isdouyinactive", "is_dash_user"
+                "odin_tt", "ttwid", "uifid", "uifid_temp", "hevc_supported", "isdouyinactive", "is_dash_user"
             ]
         }
         
@@ -635,7 +635,8 @@ nonisolated class DouyinService: @unchecked Sendable {
         for c in receivedCookies {
             let name = c.name.trimmingCharacters(in: .whitespacesAndNewlines)
             let val = c.value.trimmingCharacters(in: .whitespacesAndNewlines)
-            if (name == "odin_tt" || name == "ttwid") && !val.isEmpty {
+            let lower = name.lowercased()
+            if (name == "odin_tt" || name == "ttwid" || lower == "uifid" || lower == "uifid_temp") && !val.isEmpty {
                 if cookieMap[name] != val {
                     cookieMap[name] = val
                     hasChanges = true
@@ -734,6 +735,7 @@ nonisolated class DouyinService: @unchecked Sendable {
         request.setValue("empty", forHTTPHeaderField: "sec-fetch-dest")
         request.setValue("cors", forHTTPHeaderField: "sec-fetch-mode")
         request.setValue("same-origin", forHTTPHeaderField: "sec-fetch-site")
+        request.setValue("1", forHTTPHeaderField: "x-tt-argus")
         request.httpShouldHandleCookies = false
         request.timeoutInterval = 15
         
@@ -859,6 +861,7 @@ nonisolated class DouyinService: @unchecked Sendable {
         regReq.httpMethod = "POST"
         regReq.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         regReq.setValue(ABogus.defaultUA, forHTTPHeaderField: "User-Agent")
+        regReq.setValue("1", forHTTPHeaderField: "x-tt-argus")
         let payload = """
         {"region":"cn","aid":1768,"needFid":false,"service":"www.ixigua.com","migrate_info":{"ticket":"","source":"node"},"cbUrlProtocol":"https","union":true}
         """
@@ -1014,6 +1017,7 @@ nonisolated class DouyinService: @unchecked Sendable {
                 request.setValue("empty", forHTTPHeaderField: "sec-fetch-dest")
                 request.setValue("cors", forHTTPHeaderField: "sec-fetch-mode")
                 request.setValue("same-origin", forHTTPHeaderField: "sec-fetch-site")
+                request.setValue("1", forHTTPHeaderField: "x-tt-argus")
                 request.httpShouldHandleCookies = false
                 request.timeoutInterval = 12
                 
